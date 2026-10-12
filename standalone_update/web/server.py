@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import requests as http_requests
 from flask import Flask, make_response, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_socketio import SocketIO, join_room
+from flask_socketio import SocketIO, join_room, ConnectionRefusedError
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import check_password_hash
 
@@ -81,23 +81,32 @@ def _errno_detail(exc):
 
 
 def check_log_path_writable():
-    """Warn at startup if UPDATE_LOG_PATH is unusable.
-
-    A log file owned by another user (systemd opens StandardOutput= as root even
-    when User= is set, so a scheduled run that lands first creates it as root)
-    makes every build control button fail.  Say so at boot rather than waiting
-    for someone to click.
-    """
+    """Warn at startup if UPDATE_LOG_PATH is unusable, so the problem lands in
+    the journal instead of waiting for someone to click (see the README)."""
     if not LOG_PATH:
         app.logger.warning(
             'UPDATE_LOG_PATH is not set - build control buttons will not work.')
         return
-    target = LOG_PATH if os.path.exists(LOG_PATH) else (os.path.dirname(LOG_PATH) or '.')
-    if not os.access(target, os.W_OK):
-        app.logger.warning(
-            'UPDATE_LOG_PATH %s is not writable by uid %d - build control buttons '
-            'will fail until this is fixed (e.g. chown the log file to the user '
-            'this service runs as).', LOG_PATH, os.geteuid())
+    getuid = getattr(os, 'getuid', None)  # os.access() tests the real uid
+    whoami = f'uid {getuid()}' if getuid else 'this user'
+    if os.path.exists(LOG_PATH):
+        if not os.path.isfile(LOG_PATH):
+            problem = 'is not a regular file'
+        elif not os.access(LOG_PATH, os.W_OK):
+            problem = f'is not writable by {whoami}'
+        else:
+            return
+    else:
+        parent = os.path.dirname(LOG_PATH) or '.'
+        if not os.path.isdir(parent):
+            problem = f'cannot be created - {parent} does not exist'
+        elif not os.access(parent, os.W_OK):
+            problem = f'cannot be created - {parent} is not writable by {whoami}'
+        else:
+            return
+    app.logger.warning(
+        'UPDATE_LOG_PATH %s %s - build control buttons will fail until this is '
+        'fixed (see standalone_update/README.md).', LOG_PATH, problem)
 
 
 # Process tracking
@@ -119,15 +128,23 @@ def get_status():
         if _log_file is not None:
             _log_file.close()
             _log_file = None
-        if LOG_PATH:
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            footer = (f'=== Web UI: {_running_action_base} completed at {timestamp} ===\n' if exit_code == 0
-                      else f'=== Web UI: {_running_action_base} failed (exit code {exit_code}) at {timestamp} ===\n')
-            with open(LOG_PATH, 'a') as f:
-                f.write(footer)
+        # Clear state *before* the footer write. The run is over either way,
+        # and leaving _running_process set would make every later get_status()
+        # raise again, killing the watcher greenlet along with it.
+        action_base = _running_action_base
         _running_process = None
         _running_action = None
         _running_action_base = None
+        if LOG_PATH:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            footer = (f'=== Web UI: {action_base} completed at {timestamp} ===\n' if exit_code == 0
+                      else f'=== Web UI: {action_base} failed (exit code {exit_code}) at {timestamp} ===\n')
+            try:
+                with open(LOG_PATH, 'a') as f:
+                    f.write(footer)
+            except OSError:
+                app.logger.warning('Could not append the completion footer to %s',
+                                   LOG_PATH, exc_info=True)
         # Immediately notify clients of completion
         _last_emitted_status = 'idle'
         socketio.emit('build_status', {'status': 'idle', 'is_running': False}, to='page:server')
@@ -140,6 +157,7 @@ def get_status():
 def start_update(restart_only=False, stop_only=False, update_mods_only=False):
     """Start the update script in the background. Returns True on success."""
     global _running_process, _running_action, _running_action_base, _log_file
+    global _last_emitted_status
     if not LOG_PATH:
         return False
     status, is_running = get_status()
@@ -186,6 +204,14 @@ def start_update(restart_only=False, stop_only=False, update_mods_only=False):
             cwd=SCRIPT_DIR
         )
     except OSError as exc:
+        # The log was truncated above, so leave a marker rather than letting it
+        # read as a run that started and never finished.
+        try:
+            _log_file.write(
+                f'=== Web UI: {action} failed to start: {_errno_detail(exc)} ===\n')
+            _log_file.flush()
+        except OSError:
+            pass
         _log_file.close()
         _log_file = None
         raise UpdateStartError(
@@ -401,8 +427,16 @@ def _start_watcher():
 
 @socketio.on('connect')
 def handle_connect():
-    if not current_user.is_authenticated:
-        return False
+    # Raise rather than `return False`: ConnectionRefusedError is the one
+    # exception Flask-SocketIO lets past the default error handler, so this
+    # stays fail-closed no matter what goes wrong in the auth check.
+    try:
+        authenticated = current_user.is_authenticated
+    except Exception as exc:
+        app.logger.exception('Authentication check failed during handshake')
+        raise ConnectionRefusedError('authentication check failed') from exc
+    if not authenticated:
+        raise ConnectionRefusedError('authentication required')
 
 
 _client_rooms = {}  # sid -> room
@@ -457,8 +491,7 @@ def handle_server_action(data):
         app.logger.error('server_action %r failed: %s', action, exc, exc_info=True)
         return {'ok': False, 'error': str(exc)}
     except Exception as exc:
-        # Any uncaught exception here would send no ack at all, leaving the
-        # button looking dead with nothing in the browser console.
+        # Without this the click gets no ack at all and the button looks dead.
         app.logger.exception('server_action %r raised an unexpected error', action)
         return {'ok': False,
                 'error': f'Unexpected {type(exc).__name__} while starting '
